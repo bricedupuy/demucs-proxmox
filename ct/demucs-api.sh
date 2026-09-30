@@ -245,7 +245,7 @@ create_container() {
     --unprivileged 1 \
     --onboot "$ONBOOT" \
     --ostype debian \
-    --features keyctl=1 \
+    --features nesting=1,keyctl=1 \
     --start 1
 }
 

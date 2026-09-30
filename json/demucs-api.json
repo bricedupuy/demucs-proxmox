@@ -9,9 +9,9 @@
   "updateable": true,
   "privileged": false,
   "interface_port": 8000,
-  "documentation": "https://github.com/CHANGE_ME/demucs-proxmox#readme",
+  "documentation": "https://github.com/bricedupuy/demucs-proxmox#readme",
   "website": "https://pypi.org/project/demucs/",
-  "repository": "https://github.com/CHANGE_ME/demucs-proxmox",
+  "repository": "https://github.com/bricedupuy/demucs-proxmox",
   "architectures": [
     "amd64"
   ],

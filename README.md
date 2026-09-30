@@ -48,22 +48,6 @@ json/demucs-api.json             Community Scripts-style metadata
 API.md                           API and reverse-proxy documentation
 ```
 
-## Before first use
-
-After uploading this repository to GitHub, edit `ct/demucs-api.sh` and replace:
-
-```bash
-DEFAULT_REPO="CHANGE_ME/demucs-proxmox"
-```
-
-with your real repository, e.g.:
-
-```bash
-DEFAULT_REPO="alexandre/demucs-proxmox"
-```
-
-Also replace `CHANGE_ME` in `json/demucs-api.json`.
-
 ## Install
 
 Run on the Proxmox VE host as root:

@@ -217,12 +217,22 @@ choose_settings() {
 find_template() {
   info "Refreshing Debian template list"
   pveam update >/dev/null
-  TEMPLATE=$(pveam available --section system | awk '/debian-13-standard_/ {print $2}' | sort -V | tail -1)
-  [[ -n "$TEMPLATE" ]] || die "Could not find a Debian 13 standard template."
+
+  HOST_ARCH="$(dpkg --print-architecture)"
+
+  TEMPLATE=$(pveam available --section system \
+    | awk '/debian-13-standard_/ {print $2}' \
+    | grep "_${HOST_ARCH}\.tar\.zst$" \
+    | sort -V \
+    | tail -1)
+
+  [[ -n "$TEMPLATE" ]] || die "Could not find a Debian 13 standard template for architecture: $HOST_ARCH"
+
   if ! pveam list "$TEMPLATE_STORAGE" | awk '{print $1}' | grep -q "/$TEMPLATE$"; then
     info "Downloading $TEMPLATE to $TEMPLATE_STORAGE"
     pveam download "$TEMPLATE_STORAGE" "$TEMPLATE"
   fi
+
   TEMPLATE_PATH="${TEMPLATE_STORAGE}:vztmpl/${TEMPLATE}"
 }
 

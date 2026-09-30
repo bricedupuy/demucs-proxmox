@@ -53,7 +53,7 @@ API.md                           API and reverse-proxy documentation
 Run on the Proxmox VE host as root:
 
 ```bash
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/YOUR_USER/demucs-proxmox/main/ct/demucs-api.sh)"
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/bricedupuy/demucs-proxmox/main/ct/demucs-api.sh)"
 ```
 
 Default installation:

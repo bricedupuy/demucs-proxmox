@@ -40,6 +40,7 @@ update_inside_container() {
 
   info "Updating application files"
   curl -fsSL "$BASE_URL/app/main.py" -o /opt/demucs-api/main.py
+  curl -fsSL "$BASE_URL/app/analysis.py" -o /opt/demucs-api/analysis.py
   curl -fsSL "$BASE_URL/app/requirements.txt" -o /opt/demucs-api/requirements.txt
   curl -fsSL "$BASE_URL/app/VERSION" -o /opt/demucs-api/VERSION
 

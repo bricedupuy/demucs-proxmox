@@ -26,6 +26,8 @@ from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadF
 from fastapi.responses import FileResponse, PlainTextResponse
 from pydantic import BaseModel, HttpUrl
 
+import analysis
+
 DATA_DIR = Path(os.getenv("DEMUX_DATA_DIR", "/var/lib/demucs-api"))
 JOBS_DIR = DATA_DIR / "jobs"
 DB_PATH = DATA_DIR / "jobs.db"
@@ -103,6 +105,7 @@ def init_db() -> None:
             "hq_not_before": "REAL",
             "hq_completed_at": "REAL",
             "hq_r2_json": "TEXT",
+            "analysis_json": "TEXT",
             "callback_url": "TEXT",
             "callback_secret": "TEXT",
         }
@@ -191,6 +194,16 @@ def stage_public(row: sqlite3.Row, quality: Literal["fast", "hq"]) -> dict:
     return output
 
 
+def public_analysis(row: sqlite3.Row) -> dict | None:
+    raw = row["analysis_json"]
+    if not raw:
+        return None
+    try:
+        return analysis.sanitize_analysis(json.loads(raw))
+    except ValueError:
+        return None
+
+
 def public_job(row: sqlite3.Row) -> dict:
     return {
         "id": row["id"],
@@ -202,6 +215,7 @@ def public_job(row: sqlite3.Row) -> dict:
         "error": row["error"],
         "fast": stage_public(row, "fast"),
         "hq": stage_public(row, "hq"),
+        "analysis": public_analysis(row),
         "callback_configured": bool(row["callback_url"]),
     }
 
@@ -439,6 +453,19 @@ def enqueue_notification(job_id: str, event: str) -> None:
         ))
 
 
+def run_analysis(job_id: str) -> dict | None:
+    try:
+        row = get_job(job_id)
+        inputs = sorted((JOBS_DIR / job_id / "input").iterdir())
+        return analysis.analyze_job(
+            result_files(job_id, "fast"), inputs[0] if inputs else None,
+            JOBS_DIR / job_id, row["fast_device"],
+        )
+    except Exception:
+        analysis.log.exception("analysis failed for job %s", job_id)
+        return None
+
+
 def process_stage(job_id: str, quality: Literal["fast", "hq"]) -> None:
     now = time.time()
     overall_processing = "fast_processing" if quality == "fast" else "hq_processing"
@@ -452,15 +479,22 @@ def process_stage(job_id: str, quality: Literal["fast", "hq"]) -> None:
     try:
         run_demucs(job_id, quality)
         r2 = upload_r2(job_id, quality, result_files(job_id, quality))
+        found = None
+        if quality == "fast":
+            # Last step of the fast pass: the analysis must be stored before the stage is
+            # reported completed. It never fails the job.
+            found = run_analysis(job_id)
         finished = time.time()
         if quality == "fast":
             row = get_job(job_id)
             overall = "hq_scheduled" if row["hq_enabled"] else "completed"
             with db() as conn:
                 conn.execute("""
-                    UPDATE jobs SET status=?,fast_status='completed',fast_completed_at=?,fast_r2_json=?,updated_at=?
+                    UPDATE jobs SET status=?,fast_status='completed',fast_completed_at=?,fast_r2_json=?,
+                        analysis_json=?,updated_at=?
                     WHERE id=?
-                """, (overall, finished, json.dumps(r2) if r2 else None, finished, job_id))
+                """, (overall, finished, json.dumps(r2) if r2 else None,
+                      json.dumps(found) if found else None, finished, job_id))
             enqueue_notification(job_id, "fast.completed")
         else:
             with db() as conn:
@@ -609,7 +643,7 @@ async def lifespan(_: FastAPI):
         task.cancel()
 
 
-app = FastAPI(title="Demucs API", version="1.3.0", lifespan=lifespan)
+app = FastAPI(title="Demucs API", version="1.4.0", lifespan=lifespan)
 
 
 class StageRequest(BaseModel):
@@ -639,6 +673,13 @@ class HqScheduleRequest(BaseModel):
     not_before: datetime | None = None
 
 
+def analysis_info() -> dict:
+    return {
+        "enabled": analysis.ANALYSIS_ENABLED,
+        "backend": analysis.ANALYSIS_BACKEND if analysis.ANALYSIS_ENABLED else None,
+    }
+
+
 @app.get("/api/v1/health")
 def health():
     with db() as conn:
@@ -655,6 +696,7 @@ def health():
         "allowed_devices": sorted(ALLOWED_DEVICES),
         "timezone": str(TIMEZONE),
         "hq_window": {"start_hour": HQ_START_HOUR, "end_hour": HQ_END_HOUR},
+        "analysis": analysis_info(),
     }
 
 
@@ -666,6 +708,7 @@ def models():
         "hq_default": HQ_DEFAULT_MODEL,
         "devices": sorted(ALLOWED_DEVICES),
         "default_device": DEFAULT_DEVICE,
+        "analysis": analysis_info(),
     }
 
 

@@ -138,7 +138,8 @@ DEMUX_R2_SECRET_ACCESS_KEY=
 DEMUX_R2_BUCKET=
 DEMUX_R2_PREFIX=demucs
 EOFENV
-chmod 600 "$CONF_DIR/demucs-api.env"
+chown root:demucs-api "$CONF_DIR/demucs-api.env"
+chmod 640 "$CONF_DIR/demucs-api.env"
 
 cat >"$CONF_DIR/repository.env" <<EOFREPO
 DEMUX_API_REPO=${REPO}
@@ -149,7 +150,6 @@ EOFREPO
 cat >/usr/local/bin/demucs-api-run <<'EOFRUN'
 #!/usr/bin/env bash
 set -Eeuo pipefail
-source /etc/demucs-api/demucs-api.env
 args=(main:app --host "$DEMUX_BIND" --port "$DEMUX_PORT")
 if [[ "${DEMUX_TRUST_PROXY_HEADERS:-false}" == "true" ]]; then
   args+=(--proxy-headers --forwarded-allow-ips "${DEMUX_FORWARDED_ALLOW_IPS:-127.0.0.1}")

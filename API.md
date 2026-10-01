@@ -354,10 +354,14 @@ Since v1.4 a job carries an optional, top-level `analysis` block (next to `fast`
 | `sections` | In time order: `start` (seconds) and a lowercase `label`. Labels used: `intro`, `verse`, `pre-chorus`, `chorus`, `bridge`, `inst`, `instrumental`, `solo`, `break`, `interlude`, `outro`, `tag`. |
 | `*.confidence` | 0 to 1 when available; omitted otherwise. |
 
-Notes on quality: the default backend is heuristic. Tempo is usually reliable; the meter is
+Notes on quality: the default backend is heuristic. Tempo is chosen with a prior toward roughly
+60-130 bpm because double/half time cannot be told apart from the audio alone: songs counted faster
+than ~140 may be reported at half tempo, and `tempo.confidence` is lowered (below 0.5) when the choice
+is a coin flip. `first_beat` is the start of bar 1 on the beat grid, extended back over a drumless
+intro to where the music starts. The meter is
 3/4 vs 4/4 only; relative major/minor confusions are possible (reflected in a lower key confidence);
-section labels are a rough guess and boundaries are approximate. `first_beat` is the first
-detected downbeat, which may be later than the true first bar if the intro has no clear beat.
+section labels are a rough guess and boundaries are approximate. Downbeat placement uses
+kick accents and chord changes, so it can be a beat or a bar off on unusual material.
 
 `GET /api/v1/health` and `GET /api/v1/models` report `analysis.enabled` and `analysis.backend`.
 

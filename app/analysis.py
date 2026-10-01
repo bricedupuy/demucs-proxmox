@@ -147,40 +147,183 @@ def _mix(paths: list[Path], sr: int):
 # librosa backend
 # --------------------------------------------------------------------------- #
 
-def _rhythm(y_rhythm, sr: int) -> dict:
-    """Tempo, first downbeat and meter from drums(+bass) audio."""
+TEMPO_PRIOR_CENTER = 92.0    # bpm; log-normal prior over the "counted" tempo
+TEMPO_PRIOR_SIGMA = 0.5      # octaves
+TEMPO_RANGE = (40.0, 220.0)
+
+
+def _tempo_prior(bpm: float) -> float:
+    import math
+    return math.exp(-0.5 * (math.log2(bpm / TEMPO_PRIOR_CENTER) / TEMPO_PRIOR_SIGMA) ** 2)
+
+
+def _norm_env(env):
+    import numpy as np
+    scale = np.percentile(env, 95) if env.size else 0.0
+    return env / scale if scale > 0 else env
+
+
+def _pick_tempo(env, sr: int, hop: int) -> tuple[float, float] | None:
+    """Choose the tempo with a harmonic comb over the onset-envelope autocorrelation.
+
+    A tempo is scored by the autocorrelation at 1, 2, 3 and 4 beat lags, so a true beat
+    period (whose multiples are all accents) beats 3:2 look-alikes. Double/half-time is
+    genuinely ambiguous in audio, so the choice rests on a tempo prior and the confidence reflects how contested it is.
+    """
+    import librosa
+    import numpy as np
+
+    fps = sr / hop
+    max_lag = int(fps * 60.0 / TEMPO_RANGE[0] * 4) + 2
+    if env.size < max_lag * 2:
+        return None
+    x = env - env.mean()
+    ac = librosa.autocorrelate(x, max_size=max_lag + 1)
+    if ac[0] <= 0:
+        return None
+    ac = ac / ac[0]
+    lags = np.arange(len(ac))
+
+    def comb(b: float) -> float:
+        lag = 60.0 / b * fps
+        vals = [float(np.interp(k * lag, lags, ac)) for k in (1, 2, 3, 4) if k * lag <= len(ac) - 1]
+        return float(np.mean(vals)) if len(vals) == 4 else 0.0
+
+    grid = np.arange(TEMPO_RANGE[0], TEMPO_RANGE[1], 0.5)
+    scores = np.array([max(comb(b), 0.0) for b in grid])
+    weighted = scores * np.array([_tempo_prior(b) for b in grid])
+    if weighted.max() <= 0:
+        return None
+    best = float(grid[int(np.argmax(weighted))])
+
+    def local(b: float) -> tuple[float, float]:
+        """Best (score, bpm) within +-3% of b."""
+        sel = (grid >= b * 0.97) & (grid <= b * 1.03)
+        if not sel.any():
+            return 0.0, b
+        i = int(np.argmax(scores[sel]))
+        return float(scores[sel][i]), float(grid[sel][i])
+
+    s_best, best = local(best)
+    lower = None
+    if best / 2 >= 30.0:
+        s_half, b_half = local(best / 2)
+        lower = (s_half, b_half)
+    higher = local(best * 2) if best * 2 <= TEMPO_RANGE[1] else None
+
+    # Double/half time cannot be told apart from periodicity alone (all octaves score within a
+    # few percent), so the prior decides. Near an octave boundary the call is a coin flip:
+    # report that as a low confidence rather than a confident wrong answer.
+    ratio = 0.0
+    for alt in (lower, higher):
+        if alt and alt[0] >= 0.75 * s_best:
+            ratio = max(ratio, _tempo_prior(alt[1]) / _tempo_prior(best))
+    conf = min(1.0, max(0.0, s_best / 0.35))
+    if ratio >= 0.7:
+        conf = min(conf, 0.45)   # coin flip between octaves: below 0.5 clients ignore it
+    elif ratio >= 0.4:
+        conf = min(conf, 0.6)    # prior-driven choice, plausible alternative exists
+    return best, conf
+
+
+def _drum_flux(y_drums, sr: int, hop: int):
+    """Kick (30-150 Hz) and snare-body (150-2500 Hz) onset flux; hi-hats barely register."""
+    import librosa
+    import numpy as np
+
+    S = np.abs(librosa.stft(y_drums, n_fft=2048, hop_length=hop)) ** 2
+    freqs = librosa.fft_frequencies(sr=sr, n_fft=2048)
+
+    def flux(lo: float, hi: float):
+        band = np.log1p(S[(freqs >= lo) & (freqs < hi)].sum(axis=0) * 1e3)
+        return np.maximum(0.0, np.diff(band, prepend=band[0]))
+
+    return flux(30, 150), flux(150, 2500)
+
+
+def _harmonic_novelty(y, sr: int, hop: int, beat_frames):
+    """z-scored chroma change across each beat (current beat vs the previous one)."""
+    import librosa
+    import numpy as np
+
+    chroma = librosa.feature.chroma_stft(y=y, sr=sr, n_fft=4096, hop_length=hop)
+    out = np.zeros(len(beat_frames))
+    for i in range(1, len(beat_frames) - 1):
+        a, b, c = beat_frames[i - 1], beat_frames[i], beat_frames[i + 1]
+        if b <= a or c <= b or c > chroma.shape[1]:
+            continue
+        prev, cur = chroma[:, a:b].mean(axis=1), chroma[:, b:c].mean(axis=1)
+        out[i] = float(np.linalg.norm(cur - prev))
+    if out.std() < 1e-9:
+        return None
+    return (out - out.mean()) / out.std()
+
+
+def _music_onset(y, sr: int) -> float:
+    """Time at which the audio first becomes clearly audible (skips leading silence)."""
+    import librosa
+    import numpy as np
+    rms = librosa.feature.rms(y=y, hop_length=512)[0]
+    if rms.size == 0 or rms.max() <= 0:
+        return 0.0
+    idx = np.nonzero(rms > 0.03 * rms.max())[0]
+    return float(librosa.frames_to_time(idx[0], sr=sr, hop_length=512)) if idx.size else 0.0
+
+
+def _rhythm(y_full, y_rhythm, sr: int, y_drums=None, y_harm=None) -> dict:
+    """Tempo, first downbeat and meter.
+
+    Beats are tracked on the full mix plus the drums/bass, so a drumless intro still gets a
+    beat grid; the downbeat phase comes from low-frequency accents (kick/bass), and the grid
+    is extended back over the intro so `first_beat` is where bar 1 starts, not where the drums enter.
+    """
     import librosa
     import numpy as np
 
     hop = 512
-    env = librosa.onset.onset_strength(y=y_rhythm, sr=sr, hop_length=hop)
-    if env.size < 8 or not np.any(env > 0):
+    env_full = _norm_env(librosa.onset.onset_strength(y=y_full, sr=sr, hop_length=hop))
+    env_rhy = _norm_env(librosa.onset.onset_strength(y=y_rhythm, sr=sr, hop_length=hop))
+    n = min(len(env_full), len(env_rhy))
+    env = env_full[:n] + env_rhy[:n]
+    if n < 8 or not np.any(env > 0):
         return {}
-    tempo, beat_frames = librosa.beat.beat_track(onset_envelope=env, sr=sr, hop_length=hop)
-    bpm = float(np.atleast_1d(tempo)[0])
-    beat_frames = np.asarray(beat_frames, dtype=int)
-    result: dict[str, Any] = {}
-    if bpm <= 0 or len(beat_frames) < 4:
-        return result
+    # Hi-hats and other busy high-frequency detail make the broadband envelope look like
+    # double time. The tempo is chosen on a band below 1.5 kHz (kick, snare body, bass, chords).
+    env_lo = (_norm_env(librosa.onset.onset_strength(y=y_full, sr=sr, hop_length=hop, fmax=1500))[:n]
+              + _norm_env(librosa.onset.onset_strength(y=y_rhythm, sr=sr, hop_length=hop, fmax=1500))[:n])
 
-    # Confidence: how periodic the onset envelope is at the beat period.
-    lag = max(1, int(round(60.0 / bpm * sr / hop)))
-    ac = librosa.autocorrelate(env - env.mean(), max_size=lag * 2 + 2)
-    if ac[0] > 0:
-        lo, hi = max(1, lag - 2), min(len(ac) - 1, lag + 2)
-        periodic = float(np.max(ac[lo:hi + 1]) / ac[0])
-        result["tempo"] = {"bpm": bpm, "confidence": min(1.0, max(0.0, periodic * 1.6))}
-    else:
-        result["tempo"] = {"bpm": bpm}
+    tempo_env = env_lo
+    if y_drums is not None:
+        low, mid = _drum_flux(y_drums, sr, hop)
+        d_env = _norm_env(low)[:n] + _norm_env(mid)[:n]
+        if len(d_env) == n and np.percentile(d_env, 95) > 0 and (d_env > 0.5).mean() > 0.02:
+            tempo_env = d_env  # drum accents are the cleanest counting cue when there are drums
+
+    picked = _pick_tempo(tempo_env, sr, hop)
+    if picked is None:
+        return {}
+    bpm, tempo_conf = picked
+    result: dict[str, Any] = {"tempo": {"bpm": bpm, "confidence": tempo_conf}}
+
+    # Track beats on drum accents plus the low band of the mix, so a drumless intro is covered too.
+    beat_env = env_lo + (tempo_env if tempo_env is not env_lo else 0.0)
+    _, beat_frames = librosa.beat.beat_track(onset_envelope=beat_env, sr=sr, hop_length=hop, bpm=bpm, tightness=120, trim=False)
+    beat_frames = np.asarray(beat_frames, dtype=int)
+    if len(beat_frames) < 4:
+        return result
 
     # Meter / downbeat phase from low-frequency (kick/bass) accents per beat.
     low = librosa.onset.onset_strength(y=y_rhythm, sr=sr, hop_length=hop, fmax=300)
-    n_frames = min(len(low), len(env))
-    idx = beat_frames[beat_frames < n_frames]
-    strength = low[idx] + 0.5 * env[idx]
+    idx = beat_frames[beat_frames < len(low)]
+    strength = low[idx] + 0.5 * env_rhy[idx]
     if len(strength) < 8:
         return result
     strength = (strength - strength.mean()) / (strength.std() + 1e-9)
+    # Chord changes usually fall on bar lines: add the harmonic novelty at each beat. It also
+    # works in a drumless intro, where the kick cue is silent.
+    novelty = _harmonic_novelty(y_harm if y_harm is not None else y_full, sr, hop, idx)
+    if novelty is not None:
+        strength = strength + 1.2 * novelty
 
     scores: dict[int, tuple[float, int]] = {}
     for m in (3, 4):
@@ -191,14 +334,23 @@ def _rhythm(y_rhythm, sr: int) -> dict:
     # Prior toward 4/4: only call 3/4 when its accent pattern is clearly stronger.
     meter = 3 if scores[3][0] > scores[4][0] * 1.35 + 0.1 else 4
     contrast, phase = scores[meter]
-    meter_conf = min(1.0, max(0.0, contrast / 1.5))
-    result["time_signature"] = {"numerator": meter, "denominator": 4, "confidence": meter_conf}
+    result["time_signature"] = {
+        "numerator": meter, "denominator": 4, "confidence": min(1.0, max(0.0, contrast / 1.5)),
+    }
 
     times = librosa.frames_to_time(idx, sr=sr, hop_length=hop)
+    beat_len = 60.0 / bpm
+    bar = beat_len * meter
     if phase < len(times):
-        result["first_beat"] = float(times[phase])
-    result["_downbeat_period"] = 60.0 / bpm * meter
-    result["_first_beat_raw"] = result.get("first_beat")
+        # Median-fit the downbeat grid to all bar starts to cancel per-beat jitter, then
+        # walk it back to the first bar line at or after where the music starts.
+        bar_times = times[phase::meter]
+        k = np.arange(len(bar_times))
+        t0 = float(np.median(bar_times - k * bar))
+        onset = _music_onset(y_full, sr)
+        first = t0 - np.floor((t0 - (onset - 0.35 * beat_len)) / bar) * bar
+        result["first_beat"] = max(0.0, float(first))
+    result["_downbeat_period"] = bar
     return result
 
 
@@ -356,7 +508,9 @@ def _analyze_librosa(files: list[Path], source: Path | None, budget: _Budget) ->
     try:
         rp = [p for p in (drums, bass) if p]
         y = _mix(rp, sr) if rp else full_mix()
-        rhythm = _rhythm(y, sr)
+        harm_parts = [p for p in (bass, other) if p] or ([no_vocals] if no_vocals else [])
+        rhythm = _rhythm(full_mix(), y, sr, _load(drums, sr) if drums else None,
+                         _mix(harm_parts, sr) if harm_parts else None)
         for k in ("tempo", "time_signature", "first_beat"):
             if k in rhythm:
                 result[k] = rhythm[k]

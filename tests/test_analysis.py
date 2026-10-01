@@ -104,36 +104,46 @@ def test_failure_never_raises(tmp_path):
     assert analysis.analyze_job([bad], None, tmp_path) is None
 
 
-def _click_track(path, bpm=100, bars=24, sr=22050):
-    """4/4 drum-ish track: strong kick on beat 1, weaker clicks elsewhere; plus a C-major-ish chord bed."""
-    np = pytest.importorskip("numpy")
-    sf = pytest.importorskip("soundfile")
-    beat = 60 / bpm
-    n = int(bars * 4 * beat * sr)
-    y = np.zeros(n)
-    t = np.arange(int(0.12 * sr)) / sr
-    kick = np.sin(2 * np.pi * 55 * t) * np.exp(-t * 30)
-    hat = np.random.default_rng(0).standard_normal(len(t)) * np.exp(-t * 60) * 0.3
-    for i in range(bars * 4):
-        s = int((0.5 + i * beat) * sr)
-        if s + len(t) > n:
-            break
-        y[s:s + len(t)] += (kick if i % 4 == 0 else hat * 0.8 + kick * 0.25)
-    sf.write(path, y.astype("float32"), sr)
-    tt = np.arange(n) / sr
-    chord = sum(np.sin(2 * np.pi * f * tt) for f in (261.63, 329.63, 392.0, 130.81)) * 0.1
-    sf.write(path.with_name("other.wav"), chord.astype("float32"), sr)
+def _song(tmp_path, **kw):
+    pytest.importorskip("librosa")
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import synth
+    first, bar = synth.make_song(tmp_path, **kw)
+    return first, bar, analysis.analyze_job(sorted(tmp_path.glob("*.wav")), None, tmp_path)
 
 
 def test_end_to_end_on_synthetic_audio(tmp_path):
-    pytest.importorskip("librosa")
-    drums = tmp_path / "drums.wav"
-    _click_track(drums)
-    files = [drums, tmp_path / "other.wav"]
-    out = analysis.analyze_job(files, None, tmp_path)
+    _, _, out = _song(tmp_path, bpm=100, intro_bars=0, bars=16)
     check_contract(out)
-    assert out is not None
-    assert abs(out["tempo"]["bpm"] - 100) < 3 or abs(out["tempo"]["bpm"] - 200) < 6
-    assert out["key"]["name"] in ("C", "Am")
+    assert abs(out["tempo"]["bpm"] - 100) < 4
+    assert out["key"]["name"] in ("C", "Am", "F", "G")
     assert out["time_signature"]["numerator"] in (3, 4)
-    assert out["first_beat"] < 3
+
+
+@pytest.mark.parametrize("bpm", [80, 100, 120])
+def test_first_beat_is_bar_one_not_the_drum_entry(tmp_path, bpm):
+    """A drumless pad intro: bar 1 starts with the music, not where the drums come in."""
+    drums_in, bar, out = _song(tmp_path, bpm=bpm, intro_bars=4, bars=12, subdivide=2)
+    assert drums_in > 4 * bar - 1e-6
+    assert out["first_beat"] < 0.2 * 60 / bpm        # music starts at 0.0 in the fixture
+    assert abs(out["tempo"]["bpm"] - bpm) < 0.04 * bpm
+
+
+def test_first_beat_respects_leading_silence(tmp_path):
+    _, _, out = _song(tmp_path, bpm=100, intro_bars=2, bars=12, lead=1.5)
+    assert abs(out["first_beat"] - 1.5) < 0.2
+
+
+def test_slow_song_is_not_reported_at_double_speed(tmp_path):
+    """A 72 bpm song with busy hi-hats was reported as ~144; it must now be 72, or
+    at least not claimed with confidence >= 0.5 when wrong."""
+    _, _, out = _song(tmp_path, bpm=72, intro_bars=4, bars=12, subdivide=4)
+    t = out["tempo"]
+    assert abs(t["bpm"] - 72) < 3 or t.get("confidence", 1.0) < 0.5
+
+
+@pytest.mark.parametrize("bpm", [60, 66, 140, 150, 160])
+def test_tempos_outside_comfort_range_still_give_a_valid_block(tmp_path, bpm):
+    """Outside ~70-130 bpm the octave is a guess (folded toward the prior); the block must still be valid."""
+    _, _, out = _song(tmp_path, bpm=bpm, intro_bars=0, bars=12)
+    check_contract(out)

@@ -643,7 +643,7 @@ async def lifespan(_: FastAPI):
         task.cancel()
 
 
-app = FastAPI(title="Demucs API", version="1.4.0", lifespan=lifespan)
+app = FastAPI(title="Demucs API", version="1.5.0", lifespan=lifespan)
 
 
 class StageRequest(BaseModel):

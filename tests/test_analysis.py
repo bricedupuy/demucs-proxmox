@@ -11,11 +11,12 @@ import analysis  # noqa: E402
 KEY_RE = re.compile(r"^[A-G][#b]?m?$")
 
 
-def check_contract(a):
+def check_contract(a, duration=None):
     assert a is None or isinstance(a, dict)
     if not a:
         return
-    assert set(a) <= {"tempo", "first_beat", "time_signature", "key", "sections"}
+    assert set(a) <= {"tempo", "first_beat", "time_signature", "key", "sections",
+                      "beats", "downbeats", "intro_free", "beats_confidence"}
     for k in ("tempo", "time_signature", "key"):
         if k in a and "confidence" in a[k]:
             assert 0 <= a[k]["confidence"] <= 1
@@ -33,6 +34,23 @@ def check_contract(a):
         assert starts == sorted(starts)
         for s in a["sections"]:
             assert s["label"] in analysis.SECTION_LABELS and s["label"] == s["label"].lower()
+    # beats / downbeats: all or nothing, sorted, in range, consistent with first_beat
+    assert ("beats" in a) == ("downbeats" in a)
+    if "beats" in a:
+        beats, downs = a["beats"], a["downbeats"]
+        assert beats and downs
+        assert all(b2 > b1 for b1, b2 in zip(beats, beats[1:]))
+        assert all(d2 > d1 for d1, d2 in zip(downs, downs[1:]))
+        assert beats[0] >= 0 and (duration is None or beats[-1] <= duration)
+        assert set(downs) <= set(beats)
+        assert a["first_beat"] == downs[0]
+        assert all(round(t, 3) == t for t in beats)
+    else:
+        assert "beats_confidence" not in a
+    if "beats_confidence" in a:
+        assert 0 <= a["beats_confidence"] <= 1
+    if "intro_free" in a:
+        assert isinstance(a["intro_free"], bool)
     json.dumps(a)
 
 
@@ -46,6 +64,48 @@ def test_valid_block_passes_through():
                      {"start": 40.1, "label": "chorus"}],
     }
     assert analysis.sanitize_analysis(raw) == raw
+
+
+def test_beats_and_downbeats_round_and_stay_consistent():
+    out = analysis.sanitize_analysis({
+        "first_beat": 9.9,
+        "beats": [0.42, 1.25, 2.0834, 2.91, 3.74], "downbeats": [0.42, 3.74],
+        "beats_confidence": 0.8, "intro_free": False,
+    })
+    assert out["beats"] == [0.42, 1.25, 2.083, 2.91, 3.74]
+    assert out["downbeats"] == [0.42, 3.74]
+    assert out["first_beat"] == 0.42          # follows the first downbeat
+    assert out["beats_confidence"] == 0.8 and out["intro_free"] is False
+    check_contract(out)
+
+
+def test_invalid_beat_lists_are_dropped_whole():
+    ok_beats = [0.5, 1.0, 1.5, 2.0]
+    for bad in (
+        {"beats": [1.0, 0.5], "downbeats": [1.0]},                  # not increasing
+        {"beats": [1.0, 1.0, 2.0], "downbeats": [1.0]},             # duplicates
+        {"beats": [-0.1, 1.0], "downbeats": [1.0]},                 # negative
+        {"beats": ok_beats, "downbeats": [0.5, 9.0]},               # downbeat not a beat
+        {"beats": [], "downbeats": []},                             # empty
+        {"beats": ok_beats},                                        # downbeats missing
+        {"downbeats": [0.5]},                                       # beats missing
+        {"beats": [1.0, "x"], "downbeats": [1.0]},
+        {"beats": [1.0, float("inf")], "downbeats": [1.0]},
+    ):
+        out = analysis.sanitize_analysis({**bad, "tempo": {"bpm": 100}, "beats_confidence": 0.9})
+        assert out == {"tempo": {"bpm": 100.0}}, bad
+    assert analysis.sanitize_analysis({"beats": ok_beats, "downbeats": [0.5]}, duration=1.9) is None
+    assert analysis.sanitize_analysis({"beats": ok_beats, "downbeats": [0.5]}, duration=2.0) is not None
+
+
+def test_intro_free_only_accepts_booleans():
+    assert analysis.sanitize_analysis({"intro_free": True}) == {"intro_free": True}
+    assert analysis.sanitize_analysis({"intro_free": "yes"}) is None
+    assert analysis.sanitize_analysis({"intro_free": 1}) is None
+
+
+def test_beats_confidence_needs_beats():
+    assert analysis.sanitize_analysis({"beats_confidence": 0.9}) is None
 
 
 def test_every_field_optional():
@@ -118,6 +178,45 @@ def test_end_to_end_on_synthetic_audio(tmp_path):
     assert abs(out["tempo"]["bpm"] - 100) < 4
     assert out["key"]["name"] in ("C", "Am", "F", "G")
     assert out["time_signature"]["numerator"] in (3, 4)
+
+
+def _check_beats(out, bpm, tmp_path):
+    import soundfile as sf
+    duration = sf.info(str(tmp_path / "drums.wav")).duration
+    check_contract(out, duration)
+    beats, downs = out["beats"], out["downbeats"]
+    import statistics
+    median_bpm = 60 / statistics.median(b - a for a, b in zip(beats, beats[1:]))
+    assert abs(out["tempo"]["bpm"] - median_bpm) < 0.1      # tempo is the median beat interval
+    assert out["first_beat"] == downs[0]
+    assert len(beats) > 4 * len(downs) - 8 and len(downs) > 3  # about four beats per bar
+
+
+@pytest.mark.parametrize("bpm", [80, 100, 120])
+def test_beats_are_reported_and_consistent(tmp_path, bpm):
+    _, _, out = _song(tmp_path, bpm=bpm, intro_bars=2, bars=12)
+    _check_beats(out, bpm, tmp_path)
+    steps = [b - a for a, b in zip(out["beats"], out["beats"][1:])]
+    assert all(abs(x - 60 / bpm) < 0.1 * 60 / bpm for x in steps)   # beat-level, not half or double
+
+
+def test_steady_pad_intro_is_not_intro_free(tmp_path):
+    _, _, out = _song(tmp_path, bpm=100, intro_bars=4, bars=12)
+    assert out.get("intro_free") is not True
+    assert out["first_beat"] < 0.2
+
+
+def test_free_intro_is_detected_and_first_beat_waits_for_the_beat(tmp_path):
+    first, _, out = _song(tmp_path, bpm=100, free_intro=14.0, bars=14)
+    assert out["intro_free"] is True
+    assert abs(out["first_beat"] - first) < 0.15
+    assert out["beats"][0] == out["first_beat"]          # nothing listed from the free intro
+    _check_beats(out, 100, tmp_path)
+
+
+def test_no_intro_means_not_intro_free(tmp_path):
+    _, _, out = _song(tmp_path, bpm=100, intro_bars=0, bars=14)
+    assert out.get("intro_free") in (False, None)
 
 
 @pytest.mark.parametrize("bpm", [80, 100, 120])

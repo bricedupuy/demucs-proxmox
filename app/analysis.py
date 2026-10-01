@@ -58,8 +58,24 @@ def _with_conf(out: dict, raw: dict) -> dict:
     return out
 
 
-def sanitize_analysis(raw: Any) -> dict | None:
-    """Return a contract-conformant analysis dict, or None when nothing valid is left."""
+def _time_list(value: Any, duration: float | None) -> list[float] | None:
+    """A strictly increasing list of times in [0, duration], rounded to the millisecond."""
+    if not isinstance(value, list) or not value:
+        return None
+    out = []
+    for v in value:
+        t = _num(v)
+        if t is None or t < 0 or t > (duration if duration is not None else FIRST_BEAT_RANGE[1] * 10):
+            return None
+        out.append(round(t, 3))
+    return out if all(b > a for a, b in zip(out, out[1:])) else None
+
+
+def sanitize_analysis(raw: Any, duration: float | None = None) -> dict | None:
+    """Return a contract-conformant analysis dict, or None when nothing valid is left.
+
+    `beats` / `downbeats` are all-or-nothing: an invalid list is dropped, never trimmed.
+    """
     if not isinstance(raw, dict):
         return None
     out: dict[str, Any] = {}
@@ -73,6 +89,21 @@ def sanitize_analysis(raw: Any) -> dict | None:
     first_beat = _num(raw.get("first_beat"))
     if first_beat is not None and FIRST_BEAT_RANGE[0] <= first_beat <= FIRST_BEAT_RANGE[1]:
         out["first_beat"] = round(first_beat, 3)
+
+    beats = _time_list(raw.get("beats"), duration)
+    downbeats = _time_list(raw.get("downbeats"), duration)
+    if beats and downbeats and set(downbeats) <= set(beats):
+        out["beats"], out["downbeats"] = beats, downbeats
+        conf = _confidence(raw.get("beats_confidence"))
+        if conf is not None:
+            out["beats_confidence"] = conf
+        # Keep first_beat and the downbeats consistent: the first downbeat is the first beat of bar 1.
+        if downbeats[0] <= FIRST_BEAT_RANGE[1]:
+            out["first_beat"] = downbeats[0]
+        else:
+            out.pop("first_beat", None)
+    if isinstance(raw.get("intro_free"), bool):
+        out["intro_free"] = raw["intro_free"]
 
     ts = raw.get("time_signature")
     if isinstance(ts, dict):
@@ -259,15 +290,18 @@ def _harmonic_novelty(y, sr: int, hop: int, beat_frames):
     return (out - out.mean()) / out.std()
 
 
-def _music_onset(y, sr: int) -> float:
-    """Time at which the audio first becomes clearly audible (skips leading silence)."""
+def _music_span(y, sr: int) -> tuple[float, float]:
+    """(start, end) in seconds of the clearly audible part (skips leading/trailing silence)."""
     import librosa
     import numpy as np
     rms = librosa.feature.rms(y=y, hop_length=512)[0]
     if rms.size == 0 or rms.max() <= 0:
-        return 0.0
+        return 0.0, len(y) / sr
     idx = np.nonzero(rms > 0.03 * rms.max())[0]
-    return float(librosa.frames_to_time(idx[0], sr=sr, hop_length=512)) if idx.size else 0.0
+    if not idx.size:
+        return 0.0, len(y) / sr
+    return (float(librosa.frames_to_time(idx[0], sr=sr, hop_length=512)),
+            float(librosa.frames_to_time(idx[-1] + 1, sr=sr, hop_length=512)))
 
 
 def _rhythm(y_full, y_rhythm, sr: int, y_drums=None, y_harm=None) -> dict:
@@ -338,20 +372,160 @@ def _rhythm(y_full, y_rhythm, sr: int, y_drums=None, y_harm=None) -> dict:
         "numerator": meter, "denominator": 4, "confidence": min(1.0, max(0.0, contrast / 1.5)),
     }
 
-    times = librosa.frames_to_time(idx, sr=sr, hop_length=hop)
-    beat_len = 60.0 / bpm
-    bar = beat_len * meter
-    if phase < len(times):
-        # Median-fit the downbeat grid to all bar starts to cancel per-beat jitter, then
-        # walk it back to the first bar line at or after where the music starts.
-        bar_times = times[phase::meter]
-        k = np.arange(len(bar_times))
-        t0 = float(np.median(bar_times - k * bar))
-        onset = _music_onset(y_full, sr)
-        first = t0 - np.floor((t0 - (onset - 0.35 * beat_len)) / bar) * bar
-        result["first_beat"] = max(0.0, float(first))
-    result["_downbeat_period"] = bar
+    # Sub-frame refinement (parabolic peak interpolation): frames are 23 ms wide, which would
+    # otherwise make the median beat interval flip between two values.
+    refined = []
+    for i in idx:
+        i = int(i)
+        if 0 < i < len(beat_env) - 1:
+            y0, y1, y2 = beat_env[i - 1], beat_env[i], beat_env[i + 1]
+            denom = y0 - 2 * y1 + y2
+            delta = 0.5 * (y0 - y2) / denom if denom < 0 else 0.0
+            i = i + float(np.clip(delta, -0.5, 0.5))
+        refined.append(i)
+    T = np.asarray(refined) * hop / sr
+    duration = len(y_full) / sr
+    beat_est = float(np.median(np.diff(T)))
+    bar_est = beat_est * meter
+    s_beat = np.array([beat_env[max(0, i - 1): i + 2].max() for i in idx])
+    level = float(np.percentile(s_beat, 60))
+
+    onset, music_end = _music_span(y_full, sr)
+    target = onset - 0.35 * beat_est
+    hit = s_beat >= 0.5 * level if level > 0 else np.zeros(len(s_beat), dtype=bool)
+    # Drop trailing beats after the last one that lands on an onset: the tracker's edge
+    # effects and the ring-out of the last chord are not beats.
+    if hit.any():
+        last = int(np.nonzero(hit)[0][-1])
+        T, s_beat, hit = T[: last + 1], s_beat[: last + 1], hit[: last + 1]
+    dn = np.arange(phase, len(T), meter)
+    if len(dn) < 2:
+        return result
+    ahead = [i for i in dn if T[i] >= target - 1e-6]
+    i0 = int(ahead[0]) if ahead else int(dn[0])
+
+    # First downbeat with a sustained beat behind it (where drums / the band really come in):
+    # at least 7 of the next 8 beats land on an onset. Isolated notes of a free intro do not.
+    supported = None
+    for i in dn[dn >= i0]:
+        if hit[i: i + 8].sum() >= 7 and len(hit[i: i + 8]) >= 8:
+            supported = int(i)
+            break
+    if supported is None:
+        intro_free = None
+        supported = i0
+    else:
+        # Periodicity is measured at the beat lag, so it is only meaningful when the tempo is trusted.
+        intro_free = (_intro_free(beat_env, sr, hop, onset, T[supported], T[supported] - T[i0], beat_est, level, s_beat)
+                      if tempo_conf >= 0.5 else None)
+    first_idx = supported if intro_free else i0
+
+    beats = T[first_idx:]
+    first = float(T[first_idx])
+    if not intro_free:
+        # The grid may start later than the music (no tracked beats over a quiet intro): extend it
+        # back, bar by bar, to where the music starts. Only done for a steady (not free) intro.
+        while first - bar_est >= target and first - bar_est >= 0.0:
+            first -= bar_est
+        if first < beats[0] - 1e-6:
+            n_pre = int(round((beats[0] - first) / beat_est))
+            beats = np.concatenate([first + beat_est * np.arange(n_pre), beats])
+    first = max(0.0, first)
+    beats = beats[(beats >= 0.0) & (beats <= min(duration, music_end + 0.5 * beat_est))]
+    if len(beats) < 4:
+        return result
+    k0 = int(np.argmin(np.abs(beats - first)))
+    downbeats = beats[k0::meter]
+
+    beats_r = np.round(beats, 3)
+    downbeats_r = np.round(downbeats, 3)
+    if np.any(np.diff(beats_r) <= 0):
+        return result
+    result["tempo"]["bpm"] = 60.0 / float(np.median(np.diff(beats_r)))
+    result["first_beat"] = float(downbeats_r[0])
+    result["beats"] = [float(t) for t in beats_r]
+    result["downbeats"] = [float(t) for t in downbeats_r]
+    if intro_free is not None:
+        result["intro_free"] = intro_free
+    on_onset = float(hit[first_idx:].mean()) if len(hit[first_idx:]) else 0.0
+    result["beats_confidence"] = min(on_onset, tempo_conf)
+    result["_downbeat_period"] = bar_est
     return result
+
+
+def _periodicity(seg, lag: float) -> float:
+    """Strongest normalised autocorrelation of `seg` at 1-4 beat lags (0 when too short)."""
+    import librosa
+    import numpy as np
+
+    lags = [k for k in (1, 2, 3, 4) if k * lag * 2 < len(seg)]
+    if len(lags) < 4:   # needs the bar-length lag too, or a bar-periodic intro reads as aperiodic
+        return -1.0
+    x = seg - seg.mean()
+    ac = librosa.autocorrelate(x, max_size=int(max(lags) * lag) + 3)
+    if ac[0] <= 0:
+        return 0.0
+    ac = ac / ac[0]
+    xs = np.arange(len(ac))
+    best = 0.0
+    for k in lags:
+        centre = k * lag
+        sel = (xs >= centre * 0.97) & (xs <= centre * 1.03)
+        if sel.any():
+            best = max(best, float(ac[sel].max()))
+    return best
+
+
+def _periodicity_any(seg, fps: float) -> float:
+    """Highest autocorrelation peak of `seg` at any lag between 0.3 s and 4 s (-1 if too short).
+
+    Independent of the tempo estimate: a steady intro repeats at some lag (beat, half bar, bar);
+    a free one does not.
+    """
+    import librosa
+    import numpy as np
+
+    lo, hi = int(0.3 * fps), int(min(4.0 * fps, len(seg) / 3))
+    if hi - lo < 4:
+        return -1.0
+    x = seg - seg.mean()
+    ac = librosa.autocorrelate(x, max_size=hi + 2)
+    if ac[0] <= 0:
+        return 0.0
+    ac = ac / ac[0]
+    peaks = [float(ac[i]) for i in range(max(lo, 1), min(hi, len(ac) - 1)) if ac[i] >= ac[i - 1] and ac[i] > ac[i + 1]]
+    return max(peaks) if peaks else 0.0
+
+
+def _intro_free(beat_env, sr: int, hop: int, onset: float, t_sup: float, pre_len: float,
+                beat_est: float, level: float, s_beat) -> bool | None:
+    """True: no steady beat before the first supported downbeat (free/rubato/spoken intro).
+    False: the beat is steady before it (or there is nothing before it). None: can't tell.
+
+    Conservative: compares how periodic the onset envelope is before vs after that downbeat,
+    and only answers when the intro is long enough (>= 8 beats) to judge.
+    """
+    import numpy as np
+
+    if pre_len < 1.5 * beat_est:
+        return False
+    if pre_len < 8 * beat_est or level <= 0:
+        return None
+    fps = sr / hop
+    lag = beat_est * fps
+    a, b = int(onset * fps), int(t_sup * fps)
+    post_end = min(len(beat_env), b + int(40 * fps))
+    pre, post = beat_env[a:b], beat_env[b:post_end]
+    pre_p, post_p = _periodicity(pre, lag), _periodicity(post, lag)
+    pre_any = _periodicity_any(pre, fps)
+    if pre_p < 0 or pre_any < 0 or post_p < 0.25:
+        return None
+    if pre_p >= 0.6 * post_p:
+        return False
+    # Free only when clearly aperiodic, in absolute terms as well as relative to the groove.
+    if pre_p < 0.2 and pre_p < 0.25 * post_p and pre_any < 0.3:
+        return True
+    return None
 
 
 _KS_MAJOR = [6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88]
@@ -511,9 +685,10 @@ def _analyze_librosa(files: list[Path], source: Path | None, budget: _Budget) ->
         harm_parts = [p for p in (bass, other) if p] or ([no_vocals] if no_vocals else [])
         rhythm = _rhythm(full_mix(), y, sr, _load(drums, sr) if drums else None,
                          _mix(harm_parts, sr) if harm_parts else None)
-        for k in ("tempo", "time_signature", "first_beat"):
+        for k in ("tempo", "time_signature", "first_beat", "beats", "downbeats", "beats_confidence", "intro_free"):
             if k in rhythm:
                 result[k] = rhythm[k]
+        result["_duration"] = len(full_mix()) / sr
     except Exception:
         log.exception("analysis: rhythm step failed")
 
@@ -574,9 +749,16 @@ def _analyze_allin1(files: list[Path], source: Path | None, work_dir: Path, devi
     out: dict[str, Any] = {}
     if res.bpm:
         out["tempo"] = {"bpm": float(res.bpm)}
-    downbeats = list(res.downbeats or [])
-    if downbeats:
-        out["first_beat"] = float(downbeats[0])
+    downbeats = [round(float(t), 3) for t in (res.downbeats or [])]
+    beats = [round(float(t), 3) for t in (res.beats or [])]
+    if beats and downbeats and set(downbeats) <= set(beats):
+        out["beats"], out["downbeats"] = beats, downbeats
+        out["first_beat"] = downbeats[0]
+        if len(beats) > 2:
+            import statistics
+            out["tempo"] = {"bpm": 60.0 / statistics.median(b - a for a, b in zip(beats, beats[1:]))}
+    elif downbeats:
+        out["first_beat"] = downbeats[0]
     positions = list(res.beat_positions or [])
     if positions:
         out["time_signature"] = {"numerator": int(max(positions)), "denominator": 4}
@@ -604,6 +786,7 @@ def analyze_job(files: list[Path], source: Path | None, work_dir: Path, device: 
     budget = _Budget(ANALYSIS_TIMEOUT)
     started = time.monotonic()
     raw: dict[str, Any] = {}
+    duration = None
     try:
         if ANALYSIS_BACKEND == "allin1":
             try:
@@ -611,12 +794,17 @@ def analyze_job(files: list[Path], source: Path | None, work_dir: Path, device: 
             except Exception:
                 log.exception("analysis: allin1 backend failed; falling back to librosa")
         fallback = _analyze_librosa(files, source, budget)
-        # Keep All-In-One's values where it had them; fill the rest from librosa.
+        duration = fallback.pop("_duration", None)
+        # Keep All-In-One's values where it had them; fill the rest from librosa. Beats and the
+        # fields derived from them travel together, so never mix the two trackers' versions.
+        beat_keys = {"tempo", "first_beat", "beats", "downbeats", "beats_confidence", "intro_free"}
+        if "beats" in raw:
+            fallback = {k: v for k, v in fallback.items() if k not in beat_keys}
         for k, v in fallback.items():
             if k not in raw:
                 raw[k] = v
     except Exception:
         log.exception("analysis failed")
-    result = sanitize_analysis(raw)
+    result = sanitize_analysis(raw, duration)
     log.info("analysis done in %.1fs: fields=%s", time.monotonic() - started, sorted(result or {}))
     return result

@@ -1,6 +1,6 @@
 # Demucs API Documentation
 
-API version: **1.4.0**
+API version: **1.5.0**
 
 The service provides asynchronous Demucs stem separation with an optional two-stage workflow:
 
@@ -289,6 +289,10 @@ Example after the fast pass has completed:
     "tempo": { "bpm": 72.1, "confidence": 0.9 },
     "first_beat": 0.42,
     "time_signature": { "numerator": 4, "denominator": 4, "confidence": 0.8 },
+    "beats": [0.42, 1.25, 2.08, 2.91, 3.74],
+    "downbeats": [0.42, 3.74],
+    "beats_confidence": 0.8,
+    "intro_free": false,
     "key": { "name": "G", "confidence": 0.7 },
     "sections": [
       { "start": 0.0, "label": "intro" },
@@ -320,7 +324,7 @@ failed
 
 # Music analysis
 
-Since v1.4 a job carries an optional, top-level `analysis` block (next to `fast` and `hq`), in
+Since v1.4 a job carries an optional, top-level `analysis` block (next to `fast` and `hq`; `beats`, `downbeats`, `beats_confidence` and `intro_free` were added in v1.5), in
 `GET /api/v1/jobs/{id}` and in the `job` object of every webhook payload.
 
 ```json
@@ -328,6 +332,10 @@ Since v1.4 a job carries an optional, top-level `analysis` block (next to `fast`
   "tempo": { "bpm": 72.1, "confidence": 0.9 },
   "first_beat": 0.42,
   "time_signature": { "numerator": 4, "denominator": 4, "confidence": 0.8 },
+  "beats": [0.42, 1.25, 2.08, 2.91, 3.74],
+  "downbeats": [0.42, 3.74],
+  "beats_confidence": 0.8,
+  "intro_free": false,
   "key": { "name": "G", "confidence": 0.7 },
   "sections": [
     { "start": 0.0, "label": "intro" },
@@ -342,6 +350,10 @@ Since v1.4 a job carries an optional, top-level `analysis` block (next to `fast`
 - `analysis` is `null` until the fast pass is done, and stays `null` when analysis is disabled
   (`ANALYSIS_ENABLED=false`), failed, or found nothing. A failed analysis never fails the job.
 - Every field inside it may be absent: only what could be determined is returned.
+- `beats` and `downbeats` come as a pair or not at all, and are never partial: an invalid or empty list
+  is left out rather than trimmed. `tempo.bpm` is the median beat interval of `beats` (in BPM), and
+  `first_beat` is the first downbeat, so the three always agree. When the intro is steady but has no
+  detectable beats (a quiet pad, say), the grid is extended back to where the music starts.
 - The analysis runs as the last step of the fast pass, so it is already present when
   `fast.status` becomes `completed` and in the `fast.completed` webhook. It is not recomputed after the HQ pass.
 
@@ -350,6 +362,10 @@ Since v1.4 a job carries an optional, top-level `analysis` block (next to `fast`
 | `tempo.bpm` | Beats per minute, 20 to 400. |
 | `first_beat` | Seconds from the start of the file to the first downbeat (bar 1, beat 1), 0 to 600. |
 | `time_signature` | `numerator` 1 to 16, `denominator` one of 2, 4, 8, 16. |
+| `beats` | Every beat found, in seconds from the start of the file, strictly increasing, within the file's length, rounded to the millisecond. At the same beat level as `tempo.bpm` (not half or double time). Listed from `first_beat` onward. |
+| `downbeats` | The first beat of each bar, in seconds. Always a subset of `beats`; the first one is `first_beat`. |
+| `beats_confidence` | 0 to 1, for `beats` and `downbeats` together (low when the beats land on few onsets or the tempo octave is in doubt). Only present with `beats`. |
+| `intro_free` | `true`: no steady beat before the first downbeat (a rubato, spoken or free opening), so `first_beat` is where the beat starts. `false`: the beat is steady before it (or there is no intro). Left out when unknown. |
 | `key.name` | Letter `A`-`G`, optional `#` or `b`, then `m` for minor: `G`, `Bb`, `F#m`, `Ebm`. |
 | `sections` | In time order: `start` (seconds) and a lowercase `label`. Labels used: `intro`, `verse`, `pre-chorus`, `chorus`, `bridge`, `inst`, `instrumental`, `solo`, `break`, `interlude`, `outro`, `tag`. |
 | `*.confidence` | 0 to 1 when available; omitted otherwise. |
@@ -358,9 +374,9 @@ Notes on quality: the default backend is heuristic. Tempo is chosen with a prior
 60-130 bpm because double/half time cannot be told apart from the audio alone: songs counted faster
 than ~140 may be reported at half tempo, and `tempo.confidence` is lowered (below 0.5) when the choice
 is a coin flip. `first_beat` is the start of bar 1 on the beat grid, extended back over a drumless
-intro to where the music starts. The meter is
+intro to where the music starts (unless the intro is `intro_free`, then it is the first steady downbeat). The meter is
 3/4 vs 4/4 only; relative major/minor confusions are possible (reflected in a lower key confidence);
-section labels are a rough guess and boundaries are approximate. Downbeat placement uses
+section labels are a rough guess and boundaries are approximate. Beat times have roughly 10-25 ms of timing resolution. Downbeat placement uses
 kick accents and chord changes, so it can be a beat or a bar off on unusual material.
 
 `GET /api/v1/health` and `GET /api/v1/models` report `analysis.enabled` and `analysis.backend`.

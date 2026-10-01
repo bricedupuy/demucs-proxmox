@@ -5,14 +5,19 @@ import soundfile as sf
 SR = 22050
 
 
-def make_song(dirpath, bpm=72.0, intro_bars=4, bars=16, lead=0.0, subdivide=2, meter=4, seed=0):
+def make_song(dirpath, bpm=72.0, intro_bars=4, bars=16, lead=0.0, subdivide=2, meter=4, seed=0, free_intro=0.0):
     """A pad-only intro (chord change each bar, soft swells), then drums with kick on 1,
     snare on 3, and `subdivide` hi-hats per beat. Returns (first_downbeat_sec, bar_sec).
+    With `free_intro` seconds, the song starts with unmetered plucked notes at irregular times (no
+    steady beat); the first downbeat is then at `lead + free_intro` and the pad intro is skipped.
     Writes drums.wav, bass.wav, other.wav, vocals.wav (silent)."""
     rng = np.random.default_rng(seed)
     beat = 60.0 / bpm
     bar = beat * meter
-    total = lead + (intro_bars + bars) * bar + 1.0
+    if free_intro:
+        intro_bars = 0
+    lead_total = lead + free_intro
+    total = lead_total + (intro_bars + bars) * bar + 1.0
     n = int(total * SR)
     t = np.arange(n) / SR
     drums = np.zeros(n)
@@ -32,7 +37,7 @@ def make_song(dirpath, bpm=72.0, intro_bars=4, bars=16, lead=0.0, subdivide=2, m
     hat = np.diff(noise, 2) * np.exp(-k * 90) * 0.15  # second difference: high-passed like a real hi-hat
     chords = [(261.63, 329.63, 392.0), (220.0, 261.63, 329.63), (174.61, 220.0, 261.63), (196.0, 246.94, 293.66)]
     for b in range(intro_bars + bars):
-        t0 = lead + b * bar
+        t0 = lead_total + b * bar
         i0, i1 = int(t0 * SR), min(n, int((t0 + bar) * SR))
         f = chords[b % 4]
         seg = t[i0:i1] - t0
@@ -44,6 +49,13 @@ def make_song(dirpath, bpm=72.0, intro_bars=4, bars=16, lead=0.0, subdivide=2, m
                 hit(drums, t0 + j * beat, kick if j % 2 == 0 else snare)
                 for h in range(subdivide):
                     hit(drums, t0 + j * beat + h * beat / subdivide, hat)
+    if free_intro:
+        tt = lead
+        while tt < lead + free_intro - 0.8:
+            f = float(rng.choice([196.0, 246.94, 293.66, 329.63, 392.0]))
+            seg = np.arange(int(1.2 * SR)) / SR
+            hit(other, tt, np.sin(2 * np.pi * f * seg) * np.exp(-seg * 3) * 0.3)
+            tt += float(rng.uniform(0.35, 2.4))  # irregular: rubato / free
     for name, y in (("drums", drums), ("bass", bass), ("other", other), ("vocals", np.zeros(n))):
         sf.write(f"{dirpath}/{name}.wav", (y * 0.9).astype("float32"), SR)
-    return lead + intro_bars * bar, bar
+    return lead_total + intro_bars * bar, bar

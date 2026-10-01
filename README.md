@@ -29,6 +29,7 @@ URL -> MeTube -> Demucs fast pass -> R2
 - Direct file upload
 - Remote HTTP/HTTPS audio input (including internal MeTube URLs)
 - Optional direct Cloudflare R2/S3 upload
+- Music analysis (tempo, first downbeat, meter, key, sections) on every job after the fast pass
 - Automatic job cleanup
 - Reverse-proxy-aware public URLs and trusted forwarding configuration
 - `/usr/bin/update` updater inside the LXC
@@ -42,6 +43,8 @@ Full endpoint documentation is in **[API.md](API.md)**.
 ct/demucs-api.sh                 Proxmox LXC creator + in-LXC updater
 install/demucs-api-install.sh    First-install script
 app/main.py                      REST API, scheduler, worker and webhooks
+app/analysis.py                  Music analysis (tempo, key, sections)
+tests/                           pytest suite
 app/requirements.txt             Python dependencies
 app/VERSION                      API version
 json/demucs-api.json             Community Scripts-style metadata
@@ -122,6 +125,35 @@ hq.completed
 hq.failed
 ```
 
+## Music analysis
+
+As the last step of the fast pass, the server analyses the recording and adds an optional `analysis` block to the job and to webhook payloads (see [API.md](API.md#music-analysis)). It runs before the fast stage is reported completed, uses the separated stems, has a time budget, and never fails a job.
+
+Settings in `/etc/demucs-api/demucs-api.env`:
+
+```ini
+ANALYSIS_ENABLED=true            # false turns it off
+ANALYSIS_BACKEND=librosa         # or allin1 (opt-in, see below)
+ANALYSIS_TIMEOUT_SECONDS=60      # budget; remaining steps are skipped once exceeded
+```
+
+### Libraries and licences
+
+This server may be used commercially and its client Songverse is AGPL-3.0, so only permissively licensed code without non-commercial model files is used by default.
+
+| Component | Licence | Used |
+| --- | --- | --- |
+| librosa | ISC | **Default backend**: beat tracking, chroma, segmentation. No trained model files. |
+| soundfile / numpy | BSD-3 | Audio I/O and maths. |
+| Key detection | own code | Krumhansl-Schmuckler profile correlation on librosa chroma (published algorithm, no model). |
+| madmom | code BSD-3, **model files CC BY-NC-SA** | **Not used** (non-commercial models). |
+| Essentia | AGPL-3.0 | **Not used.** |
+| All-In-One (`allin1`) | code MIT; **weights' licence is not stated** in the repository; trained on the Harmonix Set; depends on madmom and NATTEN | **Opt-in only**, off by default. |
+
+How the default works: tempo and beats from the drums+bass stems; the meter (3 or 4 beats per bar) and the first downbeat from per-beat low-frequency accents with a prior toward 4/4; key from the bass+other stems (or `no_vocals`); sections from clustering chroma/MFCC features of the mix, snapped to bars, with labels guessed from repetition, loudness and whether the vocal stem is active. These are heuristics, not trained models: sections in particular are rough.
+
+All-In-One would give better downbeats and functional section labels. Because the licence of its weights is unspecified and it needs madmom and NATTEN (heavy to install), it is not installed or enabled by default. If you accept that after checking the licence yourself, install `allin1` in the venv and set `ANALYSIS_BACKEND=allin1`; the librosa backend still fills in anything it does not return, and any failure falls back to librosa. That path reuses the fast stems only when the fast model is `htdemucs` with four wav stems (otherwise it separates again, which takes minutes); it has not been exercised in this repository's tests.
+
 ## Cloudflare R2
 
 R2 is optional. When enabled, fast and HQ results are uploaded separately:
@@ -194,6 +226,7 @@ DEMUX_TRUST_PROXY_HEADERS=false
 DEMUX_FORWARDED_ALLOW_IPS=127.0.0.1
 DEMUX_ALLOW_PRIVATE_SOURCE_URLS=true
 DEMUX_ALLOW_PRIVATE_CALLBACK_URLS=false
+ANALYSIS_ENABLED=true
 ```
 
 Restart after editing:
@@ -243,3 +276,10 @@ The project follows the Community Scripts shape and user experience (`ct/`, `ins
 ## License
 
 MIT
+
+## Tests
+
+```bash
+pip install pytest librosa soundfile fastapi httpx boto3 python-multipart
+python -m pytest tests
+```

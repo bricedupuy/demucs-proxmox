@@ -5,3 +5,5 @@ python-multipart>=0.0.20,<1
 httpx>=0.28,<1
 boto3>=1.40,<2
 numpy>=2.0
+librosa>=0.10,<1
+soundfile>=0.12

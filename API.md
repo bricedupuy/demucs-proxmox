@@ -1,6 +1,6 @@
 # Demucs API Documentation
 
-API version: **1.3.0**
+API version: **1.4.0**
 
 The service provides asynchronous Demucs stem separation with an optional two-stage workflow:
 
@@ -101,7 +101,8 @@ Example response:
   "hq_window": {
     "start_hour": 2,
     "end_hour": 7
-  }
+  },
+  "analysis": { "enabled": true, "backend": "librosa" }
 }
 ```
 
@@ -129,7 +130,8 @@ Example response:
   "default": "htdemucs",
   "hq_default": "htdemucs_ft",
   "devices": ["cpu"],
-  "default_device": "cpu"
+  "default_device": "cpu",
+  "analysis": { "enabled": true, "backend": "librosa" }
 }
 ```
 
@@ -283,9 +285,22 @@ Example after the fast pass has completed:
     "files": [],
     "r2": null
   },
+  "analysis": {
+    "tempo": { "bpm": 72.1, "confidence": 0.9 },
+    "first_beat": 0.42,
+    "time_signature": { "numerator": 4, "denominator": 4, "confidence": 0.8 },
+    "key": { "name": "G", "confidence": 0.7 },
+    "sections": [
+      { "start": 0.0, "label": "intro" },
+      { "start": 8.3, "label": "verse" },
+      { "start": 40.1, "label": "chorus" }
+    ]
+  },
   "callback_configured": true
 }
 ```
+
+See [Music analysis](#music-analysis) for the `analysis` block.
 
 Important overall `status` values include:
 
@@ -300,6 +315,51 @@ failed
 ```
 
 `fast_completed` means the fast result is still valid but the requested HQ upgrade failed.
+
+---
+
+# Music analysis
+
+Since v1.4 a job carries an optional, top-level `analysis` block (next to `fast` and `hq`), in
+`GET /api/v1/jobs/{id}` and in the `job` object of every webhook payload.
+
+```json
+"analysis": {
+  "tempo": { "bpm": 72.1, "confidence": 0.9 },
+  "first_beat": 0.42,
+  "time_signature": { "numerator": 4, "denominator": 4, "confidence": 0.8 },
+  "key": { "name": "G", "confidence": 0.7 },
+  "sections": [
+    { "start": 0.0, "label": "intro" },
+    { "start": 8.3, "label": "verse" },
+    { "start": 40.1, "label": "chorus" }
+  ]
+}
+```
+
+**It is optional at every level.** Clients that ignore it are unaffected.
+
+- `analysis` is `null` until the fast pass is done, and stays `null` when analysis is disabled
+  (`ANALYSIS_ENABLED=false`), failed, or found nothing. A failed analysis never fails the job.
+- Every field inside it may be absent: only what could be determined is returned.
+- The analysis runs as the last step of the fast pass, so it is already present when
+  `fast.status` becomes `completed` and in the `fast.completed` webhook. It is not recomputed after the HQ pass.
+
+| Field | Meaning |
+| --- | --- |
+| `tempo.bpm` | Beats per minute, 20 to 400. |
+| `first_beat` | Seconds from the start of the file to the first downbeat (bar 1, beat 1), 0 to 600. |
+| `time_signature` | `numerator` 1 to 16, `denominator` one of 2, 4, 8, 16. |
+| `key.name` | Letter `A`-`G`, optional `#` or `b`, then `m` for minor: `G`, `Bb`, `F#m`, `Ebm`. |
+| `sections` | In time order: `start` (seconds) and a lowercase `label`. Labels used: `intro`, `verse`, `pre-chorus`, `chorus`, `bridge`, `inst`, `instrumental`, `solo`, `break`, `interlude`, `outro`, `tag`. |
+| `*.confidence` | 0 to 1 when available; omitted otherwise. |
+
+Notes on quality: the default backend is heuristic. Tempo is usually reliable; the meter is
+3/4 vs 4/4 only; relative major/minor confusions are possible (reflected in a lower key confidence);
+section labels are a rough guess and boundaries are approximate. `first_beat` is the first
+detected downbeat, which may be later than the true first bar if the intro has no clear beat.
+
+`GET /api/v1/health` and `GET /api/v1/models` report `analysis.enabled` and `analysis.backend`.
 
 ---
 
@@ -423,10 +483,13 @@ Example payload:
     "id": "06ba97c7-87f5-4a53-b208-f1ab34bf9fac",
     "status": "completed",
     "fast": {},
-    "hq": {}
+    "hq": {},
+    "analysis": {}
   }
 }
 ```
+
+The `job` object is the same as in `GET /api/v1/jobs/{id}`, including `analysis`.
 
 ## Webhook signatures
 

@@ -5,7 +5,7 @@ A Community-Scripts-style Proxmox VE installer for a dedicated **Debian 13 LXC**
 It is designed for an orchestrated workflow such as:
 
 ```text
-URL -> MeTube -> Demucs fast pass -> R2
+URL -> File -> Demucs fast pass -> R2
                      |
                      +-> scheduled nightly HQ pass -> R2 -> signed webhook
 ```
@@ -27,7 +27,7 @@ URL -> MeTube -> Demucs fast pass -> R2
 - `htdemucs` now + `htdemucs_ft` nightly upgrade workflow
 - Signed webhooks with retry persistence
 - Direct file upload
-- Remote HTTP/HTTPS audio input (including internal MeTube URLs)
+- Remote HTTP/HTTPS audio input
 - Optional direct Cloudflare R2/S3 upload
 - Music analysis (tempo, first downbeat, meter, key, sections) on every job after the fast pass
 - Automatic job cleanup
@@ -101,7 +101,7 @@ A job can ask for an immediate fast result and a scheduled HQ upgrade:
 
 ```json
 {
-  "source_url": "http://metube.internal/downloads/song.wav",
+  "source_url": "http://path.to/song.wav",
   "fast": {
     "model": "htdemucs"
   },
@@ -266,7 +266,7 @@ http://LXC_IP:8000/docs
 - Keep the API key private.
 - Prefer HTTPS at the reverse proxy.
 - Firewall port 8000 to your reverse proxy and trusted internal services.
-- Remote source URLs are allowed to reach private addresses by default because internal MeTube is a target use case. Treat this as an SSRF-sensitive capability and give API credentials only to trusted callers.
+- Remote source URLs are allowed to reach private addresses by default. Treat this as an SSRF-sensitive capability and give API credentials only to trusted callers.
 - Private webhook URLs are disabled by default.
 - Configure a per-integration webhook secret and verify `X-Demucs-Signature` on the receiving server.
 
